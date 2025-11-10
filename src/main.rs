@@ -303,8 +303,10 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>, config: &
     let mut force_redraw = false;
     
     // TODO表格数据
-    // TODO表格数据
     let mut todo_data: Vec<Vec<String>> = Vec::new();
+    
+    // TODO列表选中项
+    let mut todo_scroll_offset = 0usize; // TODO列表的滚动偏移量
 
     // 无限循环，直到通过 break 退出
     loop {
@@ -417,12 +419,49 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>, config: &
 
                     // 表格
                     if !todo_data.is_empty() {
-                        let rows: Vec<Row> = todo_data.iter().enumerate().map(|(i, row)| {
+                        // 计算每列的最大宽度
+                        let mut max_widths = vec![0; 3]; // 假设有3列
+                        for row in &todo_data {
+                            for (i, cell) in row.iter().enumerate() {
+                                if i < 3 {
+                                    let cell_width = cell.len();
+                                    if cell_width > max_widths[i] {
+                                        max_widths[i] = cell_width;
+                                    }
+                                }
+                            }
+                        }
+                        
+                        // 设置最小宽度和最大宽度
+                        for width in &mut max_widths {
+                            if *width < 8 { *width = 8; } // 最小宽度
+                            if *width > 50 { *width = 50; } // 最大宽度改为50
+                        }
+                        
+                        // 创建表格约束
+                        let constraints: Vec<Constraint> = max_widths.iter()
+                            .map(|&w| Constraint::Length(w as u16))
+                            .collect();
+
+                        // 计算可视区域的高度（减去边框和内边距）
+                        let table_height = chunks[1].height.saturating_sub(2) as usize; // 减去边框
+                        
+                        // 计算要显示的数据范围
+                        let start_idx = todo_scroll_offset;
+                        let mut end_idx = start_idx + table_height;
+                        if end_idx > todo_data.len() {
+                            end_idx = todo_data.len();
+                        }
+                        
+                        // 获取要显示的数据
+                        let visible_data: Vec<&Vec<String>> = todo_data[start_idx..end_idx].iter().collect();
+
+                        let rows: Vec<Row> = visible_data.iter().enumerate().map(|(i, row)| {
                             let cells: Vec<Cell> = row.iter().map(|cell| {
                                 Cell::from(cell.as_str())
                             }).collect();
                             
-                            let style = if i == 0 {
+                            let style = if start_idx + i == 0 {
                                 Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
                             } else {
                                 Style::default()
@@ -431,7 +470,7 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>, config: &
                             Row::new(cells).style(style)
                         }).collect();
 
-                        let table = Table::new(rows, [Constraint::Percentage(33), Constraint::Percentage(33), Constraint::Percentage(34)])
+                        let table = Table::new(rows, constraints)
                             .block(Block::default().borders(Borders::ALL).title("Tasks"));
                         
                         f.render_widget(table, chunks[1]);
@@ -443,7 +482,7 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>, config: &
                     }
 
                     // 底部帮助
-                    let help = Paragraph::new("q -- back to menu | e -- edit in neovim | r -- refresh")
+                    let help = Paragraph::new("jk -- move | q -- back to menu | e -- edit in neovim | r -- refresh")
                         .alignment(Alignment::Center)
                         .block(Block::default().borders(Borders::ALL).title("Help"));
                     f.render_widget(help, chunks[2]);
@@ -480,6 +519,7 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>, config: &
                                             match read_todo_file(config) {
                                                 Ok(content) => {
                                                     todo_data = parse_todo_table(&content);
+                                                    todo_scroll_offset = 0; // 初始化滚动偏移为0
                                                     app_state = AppState::TodoView;
                                                     last_message = None;
                                                 }
@@ -503,6 +543,7 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>, config: &
                                 // q 返回主菜单
                                 KeyCode::Char('q') => {
                                     app_state = AppState::MainMenu;
+                                    todo_scroll_offset = 0; // 重置滚动偏移
                                 }
                                 // e 编辑文件
                                 KeyCode::Char('e') => {
@@ -512,12 +553,14 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>, config: &
                                             match read_todo_file(config) {
                                                 Ok(content) => {
                                                     todo_data = parse_todo_table(&content);
+                                                    todo_scroll_offset = 0; // 重置滚动偏移
                                                     // 设置强制重绘标志，确保整个界面重新绘制
                                                     force_redraw = true;
                                                 }
                                                 Err(_) => {
                                                     // 如果读取失败，返回主菜单
                                                     app_state = AppState::MainMenu;
+                                                    todo_scroll_offset = 0; // 重置滚动偏移
                                                     force_redraw = true;
                                                 }
                                             }
@@ -525,6 +568,7 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>, config: &
                                         Err(_) => {
                                             // 如果编辑失败，返回主菜单
                                             app_state = AppState::MainMenu;
+                                            todo_scroll_offset = 0; // 重置滚动偏移
                                             force_redraw = true;
                                         }
                                     }
@@ -534,11 +578,27 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>, config: &
                                     match read_todo_file(config) {
                                         Ok(content) => {
                                             todo_data = parse_todo_table(&content);
+                                            todo_scroll_offset = 0; // 重置滚动偏移
                                         }
                                         Err(_) => {
                                             // 如果读取失败，返回主菜单
                                             app_state = AppState::MainMenu;
+                                            todo_scroll_offset = 0; // 重置滚动偏移
                                         }
+                                    }
+                                }
+                                // k 向上滚动窗口
+                                KeyCode::Char('k') => {
+                                    if todo_scroll_offset > 0 {
+                                        todo_scroll_offset -= 1;
+                                    }
+                                }
+                                // j 向下滚动窗口
+                                KeyCode::Char('j') => {
+                                    // 计算可视区域高度
+                                    let table_height = 10; // 估算的可视高度，实际应该从布局计算
+                                    if todo_scroll_offset + table_height < todo_data.len() {
+                                        todo_scroll_offset += 1;
                                     }
                                 }
                                 _ => {}
