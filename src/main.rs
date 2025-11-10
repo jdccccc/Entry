@@ -39,12 +39,14 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Serialize, Deserialize, Clone)]
 struct Config {
     todo_file_path: String,
+    cyber_resource_file_path: String,
 }
 
 impl Default for Config {
     fn default() -> Self {
         Config {
             todo_file_path: "md/TODO.md".to_string(),
+            cyber_resource_file_path: "md/CyberResource.md".to_string(),
         }
     }
 }
@@ -84,6 +86,7 @@ fn load_config() -> Config {
 enum AppState {
     MainMenu,
     TodoView,
+    CyberResourceView,
 }
 
 // 派生（自动生成）调试、复制语义、相等比较等常用特性
@@ -154,6 +157,37 @@ fn read_todo_file(config: &Config) -> Result<String, Box<dyn std::error::Error>>
     Ok(fs::read_to_string(todo_path)?)
 }
 
+// 读取CyberResource文件内容，如果文件不存在则创建默认内容
+fn read_cyber_resource_file(config: &Config) -> Result<String, Box<dyn std::error::Error>> {
+    let cyber_resource_path = &config.cyber_resource_file_path;
+    
+    // 获取文件目录
+    if let Some(parent) = Path::new(cyber_resource_path).parent() {
+        // 如果目录不存在，创建它
+        if !fs::metadata(parent).is_ok() {
+            fs::create_dir_all(parent)?;
+        }
+    }
+    
+    // 如果CyberResource.md文件不存在，创建默认内容
+    if !fs::metadata(cyber_resource_path).is_ok() {
+        // r - 表示这是一个原始字符串（raw string）
+        let default_content = r"# Cyber Resource List
+
+| 名称 | 注释 |
+|------|------|
+| GitHub | 代码托管平台 |
+| Docker | 容器化技术 |
+| Kubernetes | 容器编排系统 |
+| AWS | 云计算服务 |
+| Linux | 开源操作系统 |
+";
+        fs::write(cyber_resource_path, default_content)?;
+    }
+    
+    Ok(fs::read_to_string(cyber_resource_path)?)
+}
+
 // 解析TODO表格数据
 fn parse_todo_table(content: &str) -> Vec<Vec<String>> {
     // 创建一个可变的二维向量来存储表格数据，外层向量表示行，内层向量表示列
@@ -186,6 +220,38 @@ fn parse_todo_table(content: &str) -> Vec<Vec<String>> {
     table_data
 }
 
+// 解析CyberResource表格数据
+fn parse_cyber_resource_table(content: &str) -> Vec<Vec<String>> {
+    // 创建一个可变的二维向量来存储表格数据，外层向量表示行，内层向量表示列
+    let mut table_data = Vec::new();
+    // 将输入内容按行分割，收集到一个向量中，类型为 Vec<&str>
+    let lines: Vec<&str> = content.lines().collect();
+    
+    // 遍历每一行内容
+    for line in lines {
+        // 去除行首尾的空白字符（空格、制表符等）
+        let trimmed = line.trim();
+        // 检查是否为有效的表格行：必须以 '|' 开始和结束（Markdown 表格格式）
+        if trimmed.starts_with('|') && trimmed.ends_with('|') {
+            // 解析表格行：按 '|' 分割并处理每个单元格
+            let cells: Vec<String> = trimmed
+                .split('|')                    // 按 '|' 字符分割字符串
+                .map(|s| s.trim().to_string()) // 对每个分割部分：去除空白并转为 String
+                .filter(|s| !s.is_empty())     // 过滤掉空字符串（分割产生的边界空元素）
+                .collect();                    // 收集结果到 Vec<String>
+            
+            // 确保至少有2列（名称、注释）
+            if cells.len() >= 2 {
+                // 将解析出的单元格数据添加到表格数据中
+                table_data.push(cells);
+            }
+        }
+    }
+    
+    // 返回解析完成的表格数据
+    table_data
+}
+
 // 在neovim中打开TODO文件
 fn open_todo_in_neovim(config: &Config) -> Result<(), Box<dyn std::error::Error>> {
     // 暂时离开备用屏幕和原始模式
@@ -195,6 +261,39 @@ fn open_todo_in_neovim(config: &Config) -> Result<(), Box<dyn std::error::Error>
     // 调用neovim编辑器
     let status = Command::new("nvim")
         .arg(&config.todo_file_path)
+        .status()?;
+    
+    // 完全重置终端状态
+    execute!(
+        std::io::stdout(),
+        Clear(ClearType::All),
+        Clear(ClearType::Purge),
+        MoveTo(1, 1)
+    )?;
+    
+    // 重新进入备用屏幕和原始模式
+    enable_raw_mode()?;
+    execute!(std::io::stdout(), EnterAlternateScreen, EnableMouseCapture)?;
+    
+    // 强制刷新整个终端
+    std::io::stdout().flush()?;
+    
+    if !status.success() {
+        return Err("Failed to open neovim".into());
+    }
+    
+    Ok(())
+}
+
+// 在neovim中打开CyberResource文件
+fn open_cyber_resource_in_neovim(config: &Config) -> Result<(), Box<dyn std::error::Error>> {
+    // 暂时离开备用屏幕和原始模式
+    execute!(std::io::stdout(), LeaveAlternateScreen, DisableMouseCapture)?;
+    disable_raw_mode()?;
+    
+    // 调用neovim编辑器
+    let status = Command::new("nvim")
+        .arg(&config.cyber_resource_file_path)
         .status()?;
     
     // 完全重置终端状态
@@ -307,6 +406,12 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>, config: &
     
     // TODO列表选中项
     let mut todo_scroll_offset = 0usize; // TODO列表的滚动偏移量
+
+    // CyberResource表格数据
+    let mut cyber_resource_data: Vec<Vec<String>> = Vec::new();
+    
+    // CyberResource列表选中项
+    let mut cyber_resource_scroll_offset = 0usize; // CyberResource列表的滚动偏移量
 
     // 无限循环，直到通过 break 退出
     loop {
@@ -487,6 +592,94 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>, config: &
                         .block(Block::default().borders(Borders::ALL).title("Help"));
                     f.render_widget(help, chunks[2]);
                 }
+                AppState::CyberResourceView => {
+                    // CyberResource视图布局
+                    let chunks = Layout::default()
+                        .direction(Direction::Vertical)
+                        .constraints([
+                            Constraint::Length(3),   // 头部
+                            Constraint::Min(5),      // 表格区域
+                            Constraint::Length(3),   // 底部帮助
+                        ])
+                        .split(size);
+
+                    // 头部
+                    let header = Paragraph::new("Cyber Resource List")
+                        .alignment(Alignment::Center)
+                        .style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))
+                        .block(Block::default().borders(Borders::ALL).title("Cyber Resource"));
+                    f.render_widget(header, chunks[0]);
+
+                    // 表格
+                    if !cyber_resource_data.is_empty() {
+                        // 计算每列的最大宽度
+                        let mut max_widths = vec![0; 2]; // CyberResource有2列：名称、注释
+                        for row in &cyber_resource_data {
+                            for (i, cell) in row.iter().enumerate() {
+                                if i < 2 {
+                                    let cell_width = cell.len();
+                                    if cell_width > max_widths[i] {
+                                        max_widths[i] = cell_width;
+                                    }
+                                }
+                            }
+                        }
+                        
+                        // 设置最小宽度和最大宽度
+                        for width in &mut max_widths {
+                            if *width < 8 { *width = 8; } // 最小宽度
+                            if *width > 50 { *width = 50; } // 最大宽度改为50
+                        }
+                        
+                        // 创建表格约束
+                        let constraints: Vec<Constraint> = max_widths.iter()
+                            .map(|&w| Constraint::Length(w as u16))
+                            .collect();
+
+                        // 计算可视区域的高度（减去边框和内边距）
+                        let table_height = chunks[1].height.saturating_sub(2) as usize; // 减去边框
+                        
+                        // 计算要显示的数据范围
+                        let start_idx = cyber_resource_scroll_offset;
+                        let mut end_idx = start_idx + table_height;
+                        if end_idx > cyber_resource_data.len() {
+                            end_idx = cyber_resource_data.len();
+                        }
+                        
+                        // 获取要显示的数据
+                        let visible_data: Vec<&Vec<String>> = cyber_resource_data[start_idx..end_idx].iter().collect();
+
+                        let rows: Vec<Row> = visible_data.iter().enumerate().map(|(i, row)| {
+                            let cells: Vec<Cell> = row.iter().map(|cell| {
+                                Cell::from(cell.as_str())
+                            }).collect();
+                            
+                            let style = if start_idx + i == 0 {
+                                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+                            } else {
+                                Style::default()
+                            };
+                            
+                            Row::new(cells).style(style)
+                        }).collect();
+
+                        let table = Table::new(rows, constraints)
+                            .block(Block::default().borders(Borders::ALL).title("Resources"));
+                        
+                        f.render_widget(table, chunks[1]);
+                    } else {
+                        let empty_msg = Paragraph::new("No Cyber Resource items found")
+                            .alignment(Alignment::Center)
+                            .block(Block::default().borders(Borders::ALL));
+                        f.render_widget(empty_msg, chunks[1]);
+                    }
+
+                    // 底部帮助
+                    let help = Paragraph::new("jk -- move | q -- back to menu | e -- edit in neovim | r -- refresh")
+                        .alignment(Alignment::Center)
+                        .block(Block::default().borders(Borders::ALL).title("Help"));
+                    f.render_widget(help, chunks[2]);
+                }
             }
         })?; // 如果绘制出错，使用 `?` 传递错误
 
@@ -525,6 +718,20 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>, config: &
                                                 }
                                                 Err(e) => {
                                                     last_message = Some(format!("Error reading TODO file: {}", e));
+                                                }
+                                            }
+                                        }
+                                        MenuItem::CyberResource => {
+                                            // 读取CyberResource数据
+                                            match read_cyber_resource_file(config) {
+                                                Ok(content) => {
+                                                    cyber_resource_data = parse_cyber_resource_table(&content);
+                                                    cyber_resource_scroll_offset = 0; // 初始化滚动偏移为0
+                                                    app_state = AppState::CyberResourceView;
+                                                    last_message = None;
+                                                }
+                                                Err(e) => {
+                                                    last_message = Some(format!("Error reading CyberResource file: {}", e));
                                                 }
                                             }
                                         }
@@ -599,6 +806,72 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>, config: &
                                     let table_height = 10; // 估算的可视高度，实际应该从布局计算
                                     if todo_scroll_offset + table_height < todo_data.len() {
                                         todo_scroll_offset += 1;
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                        AppState::CyberResourceView => {
+                            match key.code {
+                                // q 返回主菜单
+                                KeyCode::Char('q') => {
+                                    app_state = AppState::MainMenu;
+                                    cyber_resource_scroll_offset = 0; // 重置滚动偏移
+                                }
+                                // e 编辑文件
+                                KeyCode::Char('e') => {
+                                    match open_cyber_resource_in_neovim(config) {
+                                        Ok(_) => {
+                                            // 重新读取文件
+                                            match read_cyber_resource_file(config) {
+                                                Ok(content) => {
+                                                    cyber_resource_data = parse_cyber_resource_table(&content);
+                                                    cyber_resource_scroll_offset = 0; // 重置滚动偏移
+                                                    // 设置强制重绘标志，确保整个界面重新绘制
+                                                    force_redraw = true;
+                                                }
+                                                Err(_) => {
+                                                    // 如果读取失败，返回主菜单
+                                                    app_state = AppState::MainMenu;
+                                                    cyber_resource_scroll_offset = 0; // 重置滚动偏移
+                                                    force_redraw = true;
+                                                }
+                                            }
+                                        }
+                                        Err(_) => {
+                                            // 如果编辑失败，返回主菜单
+                                            app_state = AppState::MainMenu;
+                                            cyber_resource_scroll_offset = 0; // 重置滚动偏移
+                                            force_redraw = true;
+                                        }
+                                    }
+                                }
+                                // r 刷新
+                                KeyCode::Char('r') => {
+                                    match read_cyber_resource_file(config) {
+                                        Ok(content) => {
+                                            cyber_resource_data = parse_cyber_resource_table(&content);
+                                            cyber_resource_scroll_offset = 0; // 重置滚动偏移
+                                        }
+                                        Err(_) => {
+                                            // 如果读取失败，返回主菜单
+                                            app_state = AppState::MainMenu;
+                                            cyber_resource_scroll_offset = 0; // 重置滚动偏移
+                                        }
+                                    }
+                                }
+                                // k 向上滚动窗口
+                                KeyCode::Char('k') => {
+                                    if cyber_resource_scroll_offset > 0 {
+                                        cyber_resource_scroll_offset -= 1;
+                                    }
+                                }
+                                // j 向下滚动窗口
+                                KeyCode::Char('j') => {
+                                    // 计算可视区域高度
+                                    let table_height = 10; // 估算的可视高度，实际应该从布局计算
+                                    if cyber_resource_scroll_offset + table_height < cyber_resource_data.len() {
+                                        cyber_resource_scroll_offset += 1;
                                     }
                                 }
                                 _ => {}
