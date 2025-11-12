@@ -9,3 +9,4 @@ crossterm = "0.27"
 serde = { version = "1.0", features = ["derive"] }
 toml = "0.8"
 calamine = "0.22"
+csv = "1"

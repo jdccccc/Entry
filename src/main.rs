@@ -1,3 +1,4 @@
+use std::cmp::Ordering;
 use std::collections::HashSet;
 use std::fmt::Write as FmtWrite;
 use std::fs;
@@ -15,6 +16,7 @@ use crossterm::{
         LeaveAlternateScreen,
     },
 };
+use csv::ReaderBuilder;
 use ratatui::{
     backend::CrosstermBackend,
     layout::{Alignment, Constraint, Direction, Layout, Rect},
@@ -141,57 +143,81 @@ struct BillEntry {
     amount: f64,
 }
 
-#[derive(Debug, Clone)]
-struct BillReport {
-    nickname: String,
-    expenses: Vec<BillEntry>,
+#[derive(Debug, Clone, Default)]
+struct BillAggregate {
     incomes: Vec<BillEntry>,
-    total_expense: f64,
-    total_income: f64,
-    small_expense_total: f64,
+    expenses: Vec<BillEntry>,
 }
 
-impl BillReport {
+impl BillAggregate {
+    fn from_entries(expenses: Vec<BillEntry>, incomes: Vec<BillEntry>) -> Self {
+        Self { incomes, expenses }
+    }
+
+    fn extend(&mut self, mut other: BillAggregate) {
+        self.incomes.append(&mut other.incomes);
+        self.expenses.append(&mut other.expenses);
+    }
+
+    fn is_empty(&self) -> bool {
+        self.incomes.is_empty() && self.expenses.is_empty()
+    }
+
+    fn total_income(&self) -> f64 {
+        self.incomes.iter().map(|e| e.amount).sum()
+    }
+
+    fn total_expense(&self) -> f64 {
+        self.expenses.iter().map(|e| e.amount).sum()
+    }
+
+    fn net(&self) -> f64 {
+        self.total_income() - self.total_expense()
+    }
+
+    fn sorted_expenses(&self) -> Vec<BillEntry> {
+        Self::sorted(&self.expenses)
+    }
+
+    fn sorted_incomes(&self) -> Vec<BillEntry> {
+        Self::sorted(&self.incomes)
+    }
+
+    fn sorted(entries: &[BillEntry]) -> Vec<BillEntry> {
+        let mut data = entries.to_vec();
+        data.sort_by(|a, b| b.amount.partial_cmp(&a.amount).unwrap_or(Ordering::Equal));
+        data
+    }
+
     fn to_markdown(&self) -> String {
         let mut out = String::new();
-        let _ = writeln!(&mut out, "# {} 微信账单分析\n", self.nickname);
-
-        let _ = writeln!(&mut out, "## 支出");
-        if self.expenses.is_empty() {
-            out.push_str("无支出记录。\n\n");
-        } else {
-            out.push_str("| 交易对方 | 商品 | 金额(元) |\n|----------|------|----------|\n");
-            for e in &self.expenses {
-                let _ = writeln!(
-                    &mut out,
-                    "| {} | {} | {:.2} |",
-                    e.partner, e.product, e.amount
-                );
-            }
-            let _ = writeln!(&mut out, "\n- 总支出：{:.2} 元", self.total_expense);
-            let _ = writeln!(
-                &mut out,
-                "- 小额支出(<100元)：{:.2} 元\n",
-                self.small_expense_total
-            );
-        }
-
-        let _ = writeln!(&mut out, "## 收入");
-        if self.incomes.is_empty() {
-            out.push_str("无收入记录。\n\n");
-        } else {
-            out.push_str("| 交易对方 | 商品 | 金额(元) |\n|----------|------|----------|\n");
-            for e in &self.incomes {
-                let _ = writeln!(
-                    &mut out,
-                    "| {} | {} | {:.2} |",
-                    e.partner, e.product, e.amount
-                );
-            }
-            let _ = writeln!(&mut out, "\n- 总收入：{:.2} 元\n", self.total_income);
-        }
-
+        let _ = writeln!(&mut out, "# 综合账单分析\n");
+        Self::write_section(
+            &mut out,
+            "支出",
+            &self.sorted_expenses(),
+            self.total_expense(),
+        );
+        Self::write_section(
+            &mut out,
+            "收入",
+            &self.sorted_incomes(),
+            self.total_income(),
+        );
         out
+    }
+
+    fn write_section(out: &mut String, title: &str, entries: &[BillEntry], total: f64) {
+        let _ = writeln!(out, "## {}", title);
+        if entries.is_empty() {
+            out.push_str("无记录。\n\n");
+            return;
+        }
+        out.push_str("| 交易对方 | 商品 | 金额(元) |\n|----------|------|----------|\n");
+        for e in entries {
+            let _ = writeln!(out, "| {} | {} | {:.2} |", e.partner, e.product, e.amount);
+        }
+        let _ = writeln!(out, "\n- 总{}：{:.2} 元\n", title, total);
     }
 }
 
@@ -199,7 +225,7 @@ struct BillState {
     bill_dir: PathBuf,
     files: Vec<PathBuf>,
     processed: HashSet<PathBuf>,
-    reports: Vec<BillReport>,
+    aggregate: BillAggregate,
     last_export_dir: PathBuf,
 }
 
@@ -211,7 +237,7 @@ impl BillState {
             bill_dir: dir,
             files: Vec::new(),
             processed: HashSet::new(),
-            reports: Vec::new(),
+            aggregate: BillAggregate::default(),
         }
     }
 
@@ -229,7 +255,11 @@ impl BillState {
             .map(|entry| entry.path())
             .filter(|path| {
                 path.extension()
-                    .map(|ext| ext.to_string_lossy().eq_ignore_ascii_case("xlsx"))
+                    .and_then(|ext| ext.to_str())
+                    .map(|ext| {
+                        let ext_lc = ext.to_ascii_lowercase();
+                        ext_lc == "xlsx" || ext_lc == "csv"
+                    })
                     .unwrap_or(false)
             })
             .collect();
@@ -246,7 +276,6 @@ impl BillState {
     }
 
     fn analyze_pending(&mut self) -> Result<usize, String> {
-        self.reports.clear();
         let mut success = 0usize;
         let mut found = false;
         for path in &self.files {
@@ -257,7 +286,7 @@ impl BillState {
             match analyze_bill_file(path) {
                 Ok(report) => {
                     self.processed.insert(path.clone());
-                    self.reports.push(report);
+                    self.aggregate.extend(report);
                     success += 1;
                 }
                 Err(e) => return Err(format!("分析失败：{}", e)),
@@ -270,49 +299,28 @@ impl BillState {
     }
 
     fn export_reports(&self, target_dir: &Path) -> io::Result<usize> {
-        if self.reports.is_empty() {
+        if self.aggregate.is_empty() {
             return Ok(0);
         }
         fs::create_dir_all(target_dir)?;
-        for report in &self.reports {
-            let file_name = format!("{}.md", sanitize_filename(&report.nickname));
-            let path = target_dir.join(file_name);
-            fs::write(path, report.to_markdown())?;
-        }
-        Ok(self.reports.len())
+        let path = target_dir.join("bill_summary.md");
+        fs::write(path, self.aggregate.to_markdown())?;
+        Ok(1)
     }
 
     fn net_summary(&self) -> Option<String> {
-        if self.reports.is_empty() {
+        if self.aggregate.is_empty() {
             return None;
         }
-        let total_income: f64 = self.reports.iter().map(|r| r.total_income).sum();
-        let total_expense: f64 = self.reports.iter().map(|r| r.total_expense).sum();
-        let net = total_income - total_expense;
+        let total_income = self.aggregate.total_income();
+        let total_expense = self.aggregate.total_expense();
+        let net = self.aggregate.net();
         let label = if net >= 0.0 { "净收入" } else { "净支出" };
         let value = net.abs();
         Some(format!(
             "{}：{:.2} 元 (收入 {:.2} - 支出 {:.2})",
             label, value, total_income, total_expense
         ))
-    }
-}
-
-fn sanitize_filename(name: &str) -> String {
-    let mut out = String::with_capacity(name.len());
-    for ch in name.chars() {
-        if ch.is_ascii_alphanumeric() || ch == '.' || ch == '-' || ch == '_' {
-            out.push(ch);
-        } else if ch.is_whitespace() {
-            out.push('_');
-        } else {
-            out.push('_');
-        }
-    }
-    if out.is_empty() {
-        "bill".into()
-    } else {
-        out
     }
 }
 
@@ -340,7 +348,20 @@ fn parse_amount(raw: &str) -> Option<f64> {
     }
 }
 
-fn analyze_bill_file(path: &Path) -> Result<BillReport, String> {
+fn analyze_bill_file(path: &Path) -> Result<BillAggregate, String> {
+    let ext = path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .map(|s| s.to_ascii_lowercase())
+        .ok_or_else(|| format!("无法识别文件类型: {}", path.display()))?;
+    match ext.as_str() {
+        "xlsx" => parse_wechat_bill(path),
+        "csv" => parse_alipay_bill(path),
+        _ => Err(format!("不支持的账单格式: {}", path.display())),
+    }
+}
+
+fn parse_wechat_bill(path: &Path) -> Result<BillAggregate, String> {
     let mut workbook: Xlsx<_> =
         open_workbook(path).map_err(|e| format!("无法打开{}: {}", path.display(), e))?;
     let range = workbook
@@ -348,21 +369,10 @@ fn analyze_bill_file(path: &Path) -> Result<BillReport, String> {
         .ok_or_else(|| "账单缺少工作表".to_string())
         .and_then(|r| r.map_err(|e| e.to_string()))?;
 
-    let nickname_raw = range
-        .get((1, 0))
-        .map(cell_to_string)
-        .ok_or_else(|| "无法读取昵称".to_string())?;
-    let nickname = nickname_raw
-        .split(['[', ']'])
-        .nth(1)
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| nickname_raw.clone());
-
     let header_idx = range
         .rows()
         .enumerate()
-        .find(|(_, row)| row.get(0).map(cell_to_string).unwrap_or_default().trim() == "交易时间")
+        .find(|(_, row)| row.first().map(cell_to_string).unwrap_or_default().trim() == "交易时间")
         .map(|(idx, _)| idx)
         .ok_or_else(|| "未找到账单列表".to_string())?;
 
@@ -396,33 +406,54 @@ fn analyze_bill_file(path: &Path) -> Result<BillReport, String> {
         }
     }
 
-    expenses.sort_by(|a, b| {
-        b.amount
-            .partial_cmp(&a.amount)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
-    incomes.sort_by(|a, b| {
-        b.amount
-            .partial_cmp(&a.amount)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
+    Ok(BillAggregate::from_entries(expenses, incomes))
+}
 
-    let total_expense: f64 = expenses.iter().map(|e| e.amount).sum();
-    let small_expense_total: f64 = expenses
-        .iter()
-        .filter(|e| e.amount < 100.0)
-        .map(|e| e.amount)
-        .sum();
-    let total_income: f64 = incomes.iter().map(|e| e.amount).sum();
+fn parse_alipay_bill(path: &Path) -> Result<BillAggregate, String> {
+    let mut content =
+        fs::read_to_string(path).map_err(|e| format!("无法读取{}: {}", path.display(), e))?;
+    if let Some(stripped) = content.strip_prefix('\u{feff}') {
+        content = stripped.to_string();
+    }
+    let start = content
+        .find("交易时间,")
+        .ok_or_else(|| "未找到账单数据表头".to_string())?;
+    let data = &content[start..];
+    let mut reader = ReaderBuilder::new()
+        .has_headers(true)
+        .from_reader(data.as_bytes());
 
-    Ok(BillReport {
-        nickname,
-        expenses,
-        incomes,
-        total_expense,
-        total_income,
-        small_expense_total,
-    })
+    let mut expenses = Vec::new();
+    let mut incomes = Vec::new();
+
+    for result in reader.records() {
+        let record = result.map_err(|e| format!("解析{}失败: {}", path.display(), e))?;
+        if record.len() < 7 {
+            continue;
+        }
+        let flow = record.get(5).unwrap_or("").trim();
+        let amount_text = record.get(6).unwrap_or("").trim();
+        if flow.is_empty() || amount_text.is_empty() {
+            continue;
+        }
+        let amount = match parse_amount(amount_text) {
+            Some(v) => v,
+            None => continue,
+        };
+        let entry = BillEntry {
+            partner: record.get(2).unwrap_or("").trim().to_string(),
+            product: record.get(4).unwrap_or("").trim().to_string(),
+            amount,
+        };
+
+        if flow.contains('支') {
+            expenses.push(entry);
+        } else if flow.contains('收') {
+            incomes.push(entry);
+        }
+    }
+
+    Ok(BillAggregate::from_entries(expenses, incomes))
 }
 
 fn prompt_export_directory(default: &Path) -> io::Result<PathBuf> {
@@ -490,18 +521,15 @@ fn render_table_generic(
 
     let mut max_w = vec![0usize; cols];
     for row in rows {
-        for i in 0..cols {
-            let cell = row.get(i).map(|s| s.as_str()).unwrap_or("");
-            max_w[i] = max_w[i].max(cell.chars().count());
+        for (i, cell) in row.iter().enumerate() {
+            if i < cols {
+                let cell_str = cell.as_str();
+                max_w[i] = max_w[i].max(cell_str.chars().count());
+            }
         }
     }
     for w in &mut max_w {
-        if *w < 8 {
-            *w = 8;
-        }
-        if *w > 50 {
-            *w = 50;
-        }
+        *w = (*w).clamp(8, 50);
     }
     let cons: Vec<Constraint> = max_w
         .iter()
@@ -596,17 +624,17 @@ fn render_bill_view(f: &mut Frame, size: Rect, bill_state: &BillState, last_msg:
         .block(Block::default().borders(Borders::ALL).title("Bill"));
     f.render_widget(header, chunks[0]);
 
-    let net_line = bill_state
-        .net_summary()
-        .unwrap_or_else(|| "暂无净收入/净支出".into());
-    let info = format!(
-        "账单目录: {dir}\n待分析账单: {pending}\n可导出报表: {reports}\n{net}",
-        dir = bill_state.bill_dir.display(),
-        pending = bill_state.pending_count(),
-        reports = bill_state.reports.len(),
-        net = net_line,
-    );
-    let info_block = Paragraph::new(info)
+    let mut info_lines = vec![
+        format!("账单目录: {}", bill_state.bill_dir.display()),
+        format!("待分析账单: {}", bill_state.pending_count()),
+        format!("已分析账单: {}", bill_state.processed.len()),
+    ];
+    if let Some(net_line) = bill_state.net_summary() {
+        info_lines.push(net_line);
+    } else {
+        info_lines.push("暂无净收入/净支出".into());
+    }
+    let info_block = Paragraph::new(info_lines.join("\n"))
         .alignment(Alignment::Left)
         .block(Block::default().borders(Borders::ALL).title("状态"));
     f.render_widget(info_block, chunks[1]);
@@ -904,7 +932,7 @@ fn run_app(
                                 force_redraw = true;
                             }
                             KeyCode::Char('o') => {
-                                if bill_state.reports.is_empty() {
+                                if bill_state.aggregate.is_empty() {
                                     last_msg = Some("请先按a完成分析".into());
                                 } else {
                                     match prompt_export_directory(&bill_state.last_export_dir) {
