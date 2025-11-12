@@ -5,6 +5,8 @@ use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::thread;
+use std::time::Duration;
 
 use calamine::{open_workbook, DataType, Reader, Xlsx};
 use crossterm::{
@@ -22,9 +24,10 @@ use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Cell, List, ListItem, ListState, Paragraph, Row, Table},
+    widgets::{Block, Borders, Cell, List, ListItem, ListState, Paragraph, Row, Table, Wrap},
     Frame, Terminal,
 };
+use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
 
 // ---------------- Configuration ----------------
@@ -33,6 +36,8 @@ struct Config {
     todo_file_path: String,
     cyber_resource_file_path: String,
     bill_dir_path: String,
+    #[serde(default)]
+    weather_api_key: String,
 }
 
 impl Default for Config {
@@ -41,6 +46,7 @@ impl Default for Config {
             todo_file_path: "md/TODO.md".into(),
             cyber_resource_file_path: "md/CyberResource.md".into(),
             bill_dir_path: "tmp".into(),
+            weather_api_key: String::new(),
         }
     }
 }
@@ -58,6 +64,219 @@ fn load_config() -> Config {
             let _ = fs::write(path, text);
         }
         cfg
+    }
+}
+
+// ---------------- Weather ----------------
+#[derive(Clone, Copy)]
+struct WeatherLocation {
+    query: &'static str,
+    label: &'static str,
+}
+
+const WEATHER_LOCATIONS: [WeatherLocation; 2] = [
+    WeatherLocation {
+        query: "beijing",
+        label: "北京",
+    },
+    WeatherLocation {
+        query: "shijiazhuang",
+        label: "石家庄",
+    },
+];
+
+const WEATHER_ENDPOINT: &str = "https://api.seniverse.com/v3/weather/now.json";
+const WEATHER_MAX_ATTEMPTS: usize = 10;
+
+#[derive(Debug, Clone)]
+struct WeatherBoard {
+    cards: Vec<WeatherCard>,
+}
+
+impl WeatherBoard {
+    fn is_fully_successful(&self) -> bool {
+        self.cards
+            .iter()
+            .all(|card| matches!(card, WeatherCard::Success { .. }))
+    }
+
+    fn is_config_error(&self) -> bool {
+        !self.cards.is_empty()
+            && self
+                .cards
+                .iter()
+                .all(|card| matches!(card, WeatherCard::Error { code, .. } if code == "CONFIG"))
+    }
+}
+
+#[derive(Debug, Clone)]
+enum WeatherCard {
+    Success {
+        name: String,
+        condition: String,
+        temperature: String,
+        last_update: String,
+    },
+    Error {
+        label: String,
+        code: String,
+        message: String,
+    },
+}
+
+impl WeatherCard {
+    fn error(label: impl Into<String>, code: impl Into<String>, message: impl Into<String>) -> Self {
+        Self::Error {
+            label: label.into(),
+            code: code.into(),
+            message: message.into(),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct SeniverseWeatherResponse {
+    results: Vec<SeniverseWeatherResult>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SeniverseWeatherResult {
+    location: SeniverseLocation,
+    now: SeniverseNow,
+    #[serde(rename = "last_update")]
+    last_update: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct SeniverseLocation {
+    name: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct SeniverseNow {
+    text: String,
+    temperature: String,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+struct SeniverseErrorResponse {
+    status: Option<String>,
+    status_code: Option<String>,
+}
+
+fn fetch_weather_board(cfg: &Config) -> WeatherBoard {
+    let key = cfg.weather_api_key.trim();
+    if key.is_empty() {
+        let cards = WEATHER_LOCATIONS
+            .iter()
+            .map(|loc| {
+                WeatherCard::error(
+                    loc.label,
+                    "CONFIG",
+                    "未配置 weather_api_key，无法请求天气",
+                )
+            })
+            .collect();
+        return WeatherBoard { cards };
+    }
+
+    let client = Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .unwrap_or_else(|_| Client::new());
+
+    let cards = WEATHER_LOCATIONS
+        .iter()
+        .map(|loc| fetch_city_weather(&client, key, loc))
+        .collect();
+    WeatherBoard { cards }
+}
+
+fn fetch_weather_board_with_retry(cfg: &Config) -> (WeatherBoard, Option<String>) {
+    let mut board = fetch_weather_board(cfg);
+    if board.is_fully_successful() || board.is_config_error() || WEATHER_MAX_ATTEMPTS == 1 {
+        let msg = if board.is_fully_successful() {
+            Some("天气更新成功".into())
+        } else if board.is_config_error() {
+            Some("未配置 weather_api_key，无法请求天气".into())
+        } else {
+            Some("天气更新失败".into())
+        };
+        return (board, msg);
+    }
+
+    for attempt in 2..=WEATHER_MAX_ATTEMPTS {
+        thread::sleep(Duration::from_millis(300));
+        board = fetch_weather_board(cfg);
+        if board.is_fully_successful() {
+            return (
+                board,
+                Some(format!("天气更新成功（第 {} 次尝试）", attempt)),
+            );
+        }
+    }
+
+    (
+        board,
+        Some(format!(
+            "天气更新失败：已尝试 {} 次",
+            WEATHER_MAX_ATTEMPTS
+        )),
+    )
+}
+
+fn fetch_city_weather(client: &Client, api_key: &str, loc: &WeatherLocation) -> WeatherCard {
+    let response = match client
+        .get(WEATHER_ENDPOINT)
+        .query(&[
+            ("key", api_key),
+            ("location", loc.query),
+            ("language", "zh-Hans"),
+            ("unit", "c"),
+        ])
+        .send()
+    {
+        Ok(resp) => resp,
+        Err(e) => {
+            return WeatherCard::error(loc.label, "NETWORK", e.to_string());
+        }
+    };
+
+    let status = response.status();
+    let bytes = match response.bytes() {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            return WeatherCard::error(loc.label, "READ", e.to_string());
+        }
+    };
+
+    if status.is_success() {
+        match serde_json::from_slice::<SeniverseWeatherResponse>(&bytes) {
+            Ok(data) => {
+                if let Some(item) = data.results.into_iter().next() {
+                    WeatherCard::Success {
+                        name: item.location.name,
+                        condition: item.now.text,
+                        temperature: item.now.temperature,
+                        last_update: item.last_update,
+                    }
+                } else {
+                    WeatherCard::error(loc.label, "EMPTY", "未返回天气数据")
+                }
+            }
+            Err(e) => WeatherCard::error(loc.label, "PARSE", e.to_string()),
+        }
+    } else {
+        let api_err = serde_json::from_slice::<SeniverseErrorResponse>(&bytes).ok();
+        let code = api_err
+            .as_ref()
+            .and_then(|e| e.status_code.clone())
+            .unwrap_or_else(|| status.as_u16().to_string());
+        let message = api_err
+            .and_then(|e| e.status.clone())
+            .or_else(|| status.canonical_reason().map(|s| s.to_string()))
+            .unwrap_or_else(|| "请求失败".to_string());
+        WeatherCard::error(loc.label, code, message)
     }
 }
 
@@ -604,6 +823,67 @@ fn render_table_page(
     f.render_widget(help, chunks[2]);
 }
 
+fn render_weather_panel(f: &mut Frame, area: Rect, board: &WeatherBoard) {
+    let block = Block::default().borders(Borders::ALL).title("Weather");
+    if board.cards.is_empty() {
+        let placeholder = Paragraph::new("暂无天气数据")
+            .alignment(Alignment::Center)
+            .block(block);
+        f.render_widget(placeholder, area);
+        return;
+    }
+
+    let mut lines: Vec<Line> = Vec::new();
+    for (idx, card) in board.cards.iter().enumerate() {
+        match card {
+            WeatherCard::Success {
+                name,
+                condition,
+                temperature,
+                last_update,
+            } => {
+                lines.push(Line::from(vec![
+                    Span::styled(
+                        name.as_str(),
+                        Style::default()
+                            .fg(Color::Cyan)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::raw("  "),
+                    Span::raw(format!("{}  {}°C", condition, temperature)),
+                ]));
+                lines.push(Line::from(format!("  更新时间 {}", last_update)));
+            }
+            WeatherCard::Error { label, code, message } => {
+                lines.push(Line::from(vec![
+                    Span::styled(
+                        label.as_str(),
+                        Style::default()
+                            .fg(Color::Red)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::raw("  "),
+                    Span::styled(
+                        format!("错误 {}", code),
+                        Style::default()
+                            .fg(Color::Yellow)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                ]));
+                lines.push(Line::from(format!("  {}", message)));
+            }
+        }
+        if idx + 1 < board.cards.len() {
+            lines.push(Line::default());
+        }
+    }
+
+    let paragraph = Paragraph::new(lines)
+        .block(block)
+        .wrap(Wrap { trim: true });
+    f.render_widget(paragraph, area);
+}
+
 fn render_bill_view(f: &mut Frame, size: Rect, bill_state: &BillState, last_msg: Option<&str>) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -718,6 +998,10 @@ fn run_app(
     let mut cyber_scroll = 0usize;
 
     let mut bill_state = BillState::new(cfg);
+    let (weather_board, weather_msg) = fetch_weather_board_with_retry(cfg);
+    if let Some(msg) = weather_msg {
+        last_msg = Some(msg);
+    }
 
     loop {
         list_state.select(Some(selected));
@@ -777,7 +1061,13 @@ fn run_app(
                                 .add_modifier(Modifier::BOLD),
                         )
                         .highlight_symbol("→ ");
-                    f.render_stateful_widget(list, chunks[1], &mut list_state);
+
+                    let body = Layout::default()
+                        .direction(Direction::Horizontal)
+                        .constraints([Constraint::Percentage(35), Constraint::Percentage(65)])
+                        .split(chunks[1]);
+                    f.render_stateful_widget(list, body[0], &mut list_state);
+                    render_weather_panel(f, body[1], &weather_board);
 
                     let help = match &last_msg {
                         Some(m) => m.as_str(),
