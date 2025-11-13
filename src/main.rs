@@ -1,10 +1,11 @@
-use std::cmp::Ordering;
 use std::collections::HashSet;
 use std::fmt::Write as FmtWrite;
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::mpsc;
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
@@ -85,29 +86,7 @@ const WEATHER_LOCATIONS: [WeatherLocation; 2] = [
     },
 ];
 
-const WEATHER_ENDPOINT: &str = "https://api.seniverse.com/v3/weather/now.json";
-const WEATHER_MAX_ATTEMPTS: usize = 10;
-
-#[derive(Debug, Clone)]
-struct WeatherBoard {
-    cards: Vec<WeatherCard>,
-}
-
-impl WeatherBoard {
-    fn is_fully_successful(&self) -> bool {
-        self.cards
-            .iter()
-            .all(|card| matches!(card, WeatherCard::Success { .. }))
-    }
-
-    fn is_config_error(&self) -> bool {
-        !self.cards.is_empty()
-            && self
-                .cards
-                .iter()
-                .all(|card| matches!(card, WeatherCard::Error { code, .. } if code == "CONFIG"))
-    }
-}
+const WEATHER_ENDPOINT: &str = "http://api.weatherapi.com/v1/forecast.json";
 
 #[derive(Debug, Clone)]
 enum WeatherCard {
@@ -115,114 +94,95 @@ enum WeatherCard {
         name: String,
         condition: String,
         temperature: String,
-        last_update: String,
     },
     Error {
         label: String,
-        code: String,
         message: String,
     },
 }
 
-impl WeatherCard {
-    fn error(label: impl Into<String>, code: impl Into<String>, message: impl Into<String>) -> Self {
-        Self::Error {
-            label: label.into(),
-            code: code.into(),
-            message: message.into(),
-        }
-    }
+#[derive(Debug, Deserialize)]
+struct WeatherApiResponse {
+    location: WeatherApiLocation,
+    current: WeatherApiCurrent,
+    forecast: WeatherApiForecast,
 }
 
 #[derive(Debug, Deserialize)]
-struct SeniverseWeatherResponse {
-    results: Vec<SeniverseWeatherResult>,
-}
-
-#[derive(Debug, Deserialize)]
-struct SeniverseWeatherResult {
-    location: SeniverseLocation,
-    now: SeniverseNow,
-    #[serde(rename = "last_update")]
-    last_update: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct SeniverseLocation {
+struct WeatherApiLocation {
     name: String,
 }
 
 #[derive(Debug, Deserialize)]
-struct SeniverseNow {
+struct WeatherApiCurrent {
+    condition: WeatherApiCondition,
+    temp_c: f64,
+}
+
+#[derive(Debug, Deserialize)]
+struct WeatherApiForecast {
+    forecastday: Vec<WeatherApiForecastDay>,
+}
+
+#[derive(Debug, Deserialize)]
+struct WeatherApiForecastDay {
+    day: WeatherApiDay,
+}
+
+#[derive(Debug, Deserialize)]
+struct WeatherApiDay {
+    maxtemp_c: f64,
+    mintemp_c: f64,
+}
+
+#[derive(Debug, Deserialize)]
+struct WeatherApiCondition {
     text: String,
-    temperature: String,
 }
 
-#[derive(Debug, Deserialize, Clone)]
-struct SeniverseErrorResponse {
-    status: Option<String>,
-    status_code: Option<String>,
-}
+fn fetch_weather_board(cfg: Config, sender: mpsc::Sender<Vec<WeatherCard>>) {
+    thread::spawn(move || {
+        let key = cfg.weather_api_key.trim();
+        if key.is_empty() {
+            let cards = WEATHER_LOCATIONS
+                .iter()
+                .map(|loc| WeatherCard::Error {
+                    label: loc.label.to_string(),
+                    message: "请在config.toml中配置weather_api_key".to_string(),
+                })
+                .collect();
+            
+            let _ = sender.send(cards);
+            return;
+        }
 
-fn fetch_weather_board(cfg: &Config) -> WeatherBoard {
-    let key = cfg.weather_api_key.trim();
-    if key.is_empty() {
-        let cards = WEATHER_LOCATIONS
+        let client = Client::builder()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .unwrap_or_else(|_| Client::new());
+
+        // 使用并行请求提高性能
+        let client = Arc::new(client);
+        let key = Arc::new(key.to_string());
+        
+        let cards: Vec<WeatherCard> = WEATHER_LOCATIONS
             .iter()
             .map(|loc| {
-                WeatherCard::error(
-                    loc.label,
-                    "CONFIG",
-                    "未配置 weather_api_key，无法请求天气",
-                )
+                let client = Arc::clone(&client);
+                let key = Arc::clone(&key);
+                let loc = loc.clone();
+                
+                std::thread::spawn(move || {
+                    fetch_city_weather(&client, &key, &loc)
+                })
             })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
             .collect();
-        return WeatherBoard { cards };
-    }
 
-    let client = Client::builder()
-        .timeout(Duration::from_secs(5))
-        .build()
-        .unwrap_or_else(|_| Client::new());
-
-    let cards = WEATHER_LOCATIONS
-        .iter()
-        .map(|loc| fetch_city_weather(&client, key, loc))
-        .collect();
-    WeatherBoard { cards }
-}
-
-fn fetch_weather_board_with_retry(cfg: &Config) -> (WeatherBoard, Option<String>) {
-    let mut board = fetch_weather_board(cfg);
-    if board.is_fully_successful() || board.is_config_error() || WEATHER_MAX_ATTEMPTS == 1 {
-        let msg = if board.is_fully_successful() {
-            Some("天气更新成功".into())
-        } else if board.is_config_error() {
-            Some("未配置 weather_api_key，无法请求天气".into())
-        } else {
-            Some("天气更新失败".into())
-        };
-        return (board, msg);
-    }
-
-    for attempt in 2..=WEATHER_MAX_ATTEMPTS {
-        thread::sleep(Duration::from_millis(300));
-        board = fetch_weather_board(cfg);
-        if board.is_fully_successful() {
-            return (
-                board,
-                Some(format!("天气更新成功（第 {} 次尝试）", attempt)),
-            );
-        }
-    }
-
-    (
-        board,
-        Some(format!(
-            "天气更新失败：已尝试 {} 次",
-            WEATHER_MAX_ATTEMPTS
-        )),
-    )
+        let _ = sender.send(cards);
+    });
 }
 
 fn fetch_city_weather(client: &Client, api_key: &str, loc: &WeatherLocation) -> WeatherCard {
@@ -230,53 +190,74 @@ fn fetch_city_weather(client: &Client, api_key: &str, loc: &WeatherLocation) -> 
         .get(WEATHER_ENDPOINT)
         .query(&[
             ("key", api_key),
-            ("location", loc.query),
-            ("language", "zh-Hans"),
-            ("unit", "c"),
+            ("q", loc.query),
+            ("lang", "zh"),
+            ("aqi", "no"),
+            ("days", "1"),
         ])
         .send()
     {
         Ok(resp) => resp,
-        Err(e) => {
-            return WeatherCard::error(loc.label, "NETWORK", e.to_string());
+        Err(_) => {
+            return WeatherCard::Error {
+                label: loc.label.to_string(),
+                message: "网络请求失败".to_string(),
+            };
         }
     };
 
-    let status = response.status();
+    if !response.status().is_success() {
+        let error_msg = match response.status().as_u16() {
+            401 => "API密钥无效或已过期".to_string(),
+            403 => "API访问被拒绝，请检查密钥权限".to_string(),
+            400 => "请求参数错误".to_string(),
+            404 => "城市未找到".to_string(),
+            429 => "API请求频率超限".to_string(),
+            500..=599 => "天气服务器内部错误".to_string(),
+            _ => format!("天气API错误 (HTTP {})", response.status()),
+        };
+        
+        return WeatherCard::Error {
+            label: loc.label.to_string(),
+            message: error_msg,
+        };
+    }
+
     let bytes = match response.bytes() {
         Ok(bytes) => bytes,
-        Err(e) => {
-            return WeatherCard::error(loc.label, "READ", e.to_string());
+        Err(_) => {
+            return WeatherCard::Error {
+                label: loc.label.to_string(),
+                message: "读取响应失败".to_string(),
+            };
         }
     };
 
-    if status.is_success() {
-        match serde_json::from_slice::<SeniverseWeatherResponse>(&bytes) {
-            Ok(data) => {
-                if let Some(item) = data.results.into_iter().next() {
+    match serde_json::from_slice::<WeatherApiResponse>(&bytes) {
+        Ok(data) => {
+            // 获取当天的预报数据
+            let forecast_day = data.forecast.forecastday.first();
+            
+            match forecast_day {
+                Some(day) => {
                     WeatherCard::Success {
-                        name: item.location.name,
-                        condition: item.now.text,
-                        temperature: item.now.temperature,
-                        last_update: item.last_update,
+                        name: data.location.name,
+                        condition: data.current.condition.text,
+                        temperature: format!("{:.1}C~{:.1}C", day.day.mintemp_c, day.day.maxtemp_c),
                     }
-                } else {
-                    WeatherCard::error(loc.label, "EMPTY", "未返回天气数据")
+                }
+                None => {
+                    WeatherCard::Error {
+                        label: loc.label.to_string(),
+                        message: "无法获取预报数据".to_string(),
+                    }
                 }
             }
-            Err(e) => WeatherCard::error(loc.label, "PARSE", e.to_string()),
         }
-    } else {
-        let api_err = serde_json::from_slice::<SeniverseErrorResponse>(&bytes).ok();
-        let code = api_err
-            .as_ref()
-            .and_then(|e| e.status_code.clone())
-            .unwrap_or_else(|| status.as_u16().to_string());
-        let message = api_err
-            .and_then(|e| e.status.clone())
-            .or_else(|| status.canonical_reason().map(|s| s.to_string()))
-            .unwrap_or_else(|| "请求失败".to_string());
-        WeatherCard::error(loc.label, code, message)
+        Err(_) => WeatherCard::Error {
+            label: loc.label.to_string(),
+            message: "解析天气数据失败".to_string(),
+        },
     }
 }
 
@@ -394,49 +375,37 @@ impl BillAggregate {
         self.total_income() - self.total_expense()
     }
 
-    fn sorted_expenses(&self) -> Vec<BillEntry> {
-        Self::sorted(&self.expenses)
-    }
-
-    fn sorted_incomes(&self) -> Vec<BillEntry> {
-        Self::sorted(&self.incomes)
-    }
-
-    fn sorted(entries: &[BillEntry]) -> Vec<BillEntry> {
-        let mut data = entries.to_vec();
-        data.sort_by(|a, b| b.amount.partial_cmp(&a.amount).unwrap_or(Ordering::Equal));
-        data
-    }
-
     fn to_markdown(&self) -> String {
         let mut out = String::new();
-        let _ = writeln!(&mut out, "# 综合账单分析\n");
-        Self::write_section(
-            &mut out,
-            "支出",
-            &self.sorted_expenses(),
-            self.total_expense(),
-        );
-        Self::write_section(
-            &mut out,
-            "收入",
-            &self.sorted_incomes(),
-            self.total_income(),
-        );
+        let _ = writeln!(&mut out, "# 账单分析\n");
+        
+        let _ = writeln!(out, "## 支出");
+        if self.expenses.is_empty() {
+            out.push_str("无支出记录。\n");
+        } else {
+            out.push_str("| 交易对方 | 商品 | 金额(元) |\n|----------|------|----------|\n");
+            for e in &self.expenses {
+                let _ = writeln!(out, "| {} | {} | {:.2} |", e.partner, e.product, e.amount);
+            }
+            let _ = writeln!(out, "\n总支出：{:.2} 元\n", self.total_expense());
+        }
+        
+        let _ = writeln!(out, "## 收入");
+        if self.incomes.is_empty() {
+            out.push_str("无收入记录。\n");
+        } else {
+            out.push_str("| 交易对方 | 商品 | 金额(元) |\n|----------|------|----------|\n");
+            for e in &self.incomes {
+                let _ = writeln!(out, "| {} | {} | {:.2} |", e.partner, e.product, e.amount);
+            }
+            let _ = writeln!(out, "\n总收入：{:.2} 元\n", self.total_income());
+        }
+        
+        let net = self.net();
+        let label = if net >= 0.0 { "净收入" } else { "净支出" };
+        let _ = writeln!(out, "{}：{:.2} 元", label, net.abs());
+        
         out
-    }
-
-    fn write_section(out: &mut String, title: &str, entries: &[BillEntry], total: f64) {
-        let _ = writeln!(out, "## {}", title);
-        if entries.is_empty() {
-            out.push_str("无记录。\n\n");
-            return;
-        }
-        out.push_str("| 交易对方 | 商品 | 金额(元) |\n|----------|------|----------|\n");
-        for e in entries {
-            let _ = writeln!(out, "| {} | {} | {:.2} |", e.partner, e.product, e.amount);
-        }
-        let _ = writeln!(out, "\n- 总{}：{:.2} 元\n", title, total);
     }
 }
 
@@ -445,14 +414,12 @@ struct BillState {
     files: Vec<PathBuf>,
     processed: HashSet<PathBuf>,
     aggregate: BillAggregate,
-    last_export_dir: PathBuf,
 }
 
 impl BillState {
     fn new(cfg: &Config) -> Self {
         let dir = PathBuf::from(&cfg.bill_dir_path);
         Self {
-            last_export_dir: dir.clone(),
             bill_dir: dir,
             files: Vec::new(),
             processed: HashSet::new(),
@@ -460,15 +427,11 @@ impl BillState {
         }
     }
 
-    fn ensure_dir(&self) -> io::Result<()> {
+    fn refresh_files(&mut self) -> io::Result<()> {
         if !self.bill_dir.exists() {
             fs::create_dir_all(&self.bill_dir)?;
         }
-        Ok(())
-    }
-
-    fn refresh_files(&mut self) -> io::Result<()> {
-        self.ensure_dir()?;
+        
         let mut list: Vec<PathBuf> = fs::read_dir(&self.bill_dir)?
             .filter_map(|entry| entry.ok())
             .map(|entry| entry.path())
@@ -496,22 +459,20 @@ impl BillState {
 
     fn analyze_pending(&mut self) -> Result<usize, String> {
         let mut success = 0usize;
-        let mut found = false;
         for path in &self.files {
             if self.processed.contains(path) {
                 continue;
             }
-            found = true;
             match analyze_bill_file(path) {
                 Ok(report) => {
                     self.processed.insert(path.clone());
                     self.aggregate.extend(report);
                     success += 1;
                 }
-                Err(e) => return Err(format!("分析失败：{}", e)),
+                Err(_) => return Err("分析失败".into()),
             }
         }
-        if !found {
+        if success == 0 {
             return Err("没有需要分析的账单".into());
         }
         Ok(success)
@@ -525,21 +486,6 @@ impl BillState {
         let path = target_dir.join("bill_summary.md");
         fs::write(path, self.aggregate.to_markdown())?;
         Ok(1)
-    }
-
-    fn net_summary(&self) -> Option<String> {
-        if self.aggregate.is_empty() {
-            return None;
-        }
-        let total_income = self.aggregate.total_income();
-        let total_expense = self.aggregate.total_expense();
-        let net = self.aggregate.net();
-        let label = if net >= 0.0 { "净收入" } else { "净支出" };
-        let value = net.abs();
-        Some(format!(
-            "{}：{:.2} 元 (收入 {:.2} - 支出 {:.2})",
-            label, value, total_income, total_expense
-        ))
     }
 }
 
@@ -572,21 +518,21 @@ fn analyze_bill_file(path: &Path) -> Result<BillAggregate, String> {
         .extension()
         .and_then(|ext| ext.to_str())
         .map(|s| s.to_ascii_lowercase())
-        .ok_or_else(|| format!("无法识别文件类型: {}", path.display()))?;
+        .ok_or_else(|| "无法识别文件类型".to_string())?;
+    
     match ext.as_str() {
         "xlsx" => parse_wechat_bill(path),
         "csv" => parse_alipay_bill(path),
-        _ => Err(format!("不支持的账单格式: {}", path.display())),
+        _ => Err("不支持的账单格式".to_string()),
     }
 }
 
 fn parse_wechat_bill(path: &Path) -> Result<BillAggregate, String> {
-    let mut workbook: Xlsx<_> =
-        open_workbook(path).map_err(|e| format!("无法打开{}: {}", path.display(), e))?;
+    let mut workbook: Xlsx<_> = open_workbook(path).map_err(|_| "无法打开文件".to_string())?;
     let range = workbook
         .worksheet_range_at(0)
         .ok_or_else(|| "账单缺少工作表".to_string())
-        .and_then(|r| r.map_err(|e| e.to_string()))?;
+        .and_then(|r| r.map_err(|_| "读取工作表失败".to_string()))?;
 
     let header_idx = range
         .rows()
@@ -606,18 +552,22 @@ fn parse_wechat_bill(path: &Path) -> Result<BillAggregate, String> {
         let partner = row.get(2).map(cell_to_string).unwrap_or_default();
         let product = row.get(3).map(cell_to_string).unwrap_or_default();
         let amount_str = row.get(5).map(cell_to_string).unwrap_or_default();
+        
         if category.is_empty() || amount_str.is_empty() {
             continue;
         }
+        
         let amount = match parse_amount(&amount_str) {
             Some(v) => v,
             None => continue,
         };
+        
         let entry = BillEntry {
             partner,
             product,
             amount,
         };
+        
         if category.contains('支') {
             expenses.push(entry);
         } else if category.contains('收') {
@@ -629,11 +579,11 @@ fn parse_wechat_bill(path: &Path) -> Result<BillAggregate, String> {
 }
 
 fn parse_alipay_bill(path: &Path) -> Result<BillAggregate, String> {
-    let mut content =
-        fs::read_to_string(path).map_err(|e| format!("无法读取{}: {}", path.display(), e))?;
+    let mut content = fs::read_to_string(path).map_err(|_| "无法读取文件".to_string())?;
     if let Some(stripped) = content.strip_prefix('\u{feff}') {
         content = stripped.to_string();
     }
+    
     let start = content
         .find("交易时间,")
         .ok_or_else(|| "未找到账单数据表头".to_string())?;
@@ -646,19 +596,23 @@ fn parse_alipay_bill(path: &Path) -> Result<BillAggregate, String> {
     let mut incomes = Vec::new();
 
     for result in reader.records() {
-        let record = result.map_err(|e| format!("解析{}失败: {}", path.display(), e))?;
+        let record = result.map_err(|_| "解析CSV失败".to_string())?;
         if record.len() < 7 {
             continue;
         }
+        
         let flow = record.get(5).unwrap_or("").trim();
         let amount_text = record.get(6).unwrap_or("").trim();
+        
         if flow.is_empty() || amount_text.is_empty() {
             continue;
         }
+        
         let amount = match parse_amount(amount_text) {
             Some(v) => v,
             None => continue,
         };
+        
         let entry = BillEntry {
             partner: record.get(2).unwrap_or("").trim().to_string(),
             product: record.get(4).unwrap_or("").trim().to_string(),
@@ -738,7 +692,7 @@ fn render_table_generic(
         return;
     }
 
-    let mut max_w = vec![0usize; cols];
+    let mut max_w = vec![8usize; cols]; // 默认最小宽度
     for row in rows {
         for (i, cell) in row.iter().enumerate() {
             if i < cols {
@@ -748,14 +702,14 @@ fn render_table_generic(
         }
     }
     for w in &mut max_w {
-        *w = (*w).clamp(8, 50);
+        *w = (*w).clamp(8, 30); // 减小最大宽度限制
     }
     let cons: Vec<Constraint> = max_w
         .iter()
         .map(|&w| Constraint::Length(w as u16))
         .collect();
 
-    let h = area.height.saturating_sub(2) as usize; // roughly visible rows inside border
+    let h = area.height.saturating_sub(2) as usize;
     let start = scroll.min(rows.len());
     let mut end = start.saturating_add(h);
     if end > rows.len() {
@@ -817,15 +771,15 @@ fn render_table_page(
 
     render_table_generic(f, chunks[1], rows, scroll, table_title);
 
-    let help = Paragraph::new("jk -- move | q -- back | e -- edit | r -- refresh")
+    let help = Paragraph::new("\tjk -- move | q -- back | e -- edit | r -- refresh")
         .alignment(Alignment::Center)
         .block(Block::default().borders(Borders::ALL).title("Help"));
     f.render_widget(help, chunks[2]);
 }
 
-fn render_weather_panel(f: &mut Frame, area: Rect, board: &WeatherBoard) {
+fn render_weather_panel(f: &mut Frame, area: Rect, cards: &[WeatherCard]) {
     let block = Block::default().borders(Borders::ALL).title("Weather");
-    if board.cards.is_empty() {
+    if cards.is_empty() {
         let placeholder = Paragraph::new("暂无天气数据")
             .alignment(Alignment::Center)
             .block(block);
@@ -834,13 +788,12 @@ fn render_weather_panel(f: &mut Frame, area: Rect, board: &WeatherBoard) {
     }
 
     let mut lines: Vec<Line> = Vec::new();
-    for (idx, card) in board.cards.iter().enumerate() {
+    for (idx, card) in cards.iter().enumerate() {
         match card {
             WeatherCard::Success {
                 name,
                 condition,
                 temperature,
-                last_update,
             } => {
                 lines.push(Line::from(vec![
                     Span::styled(
@@ -850,11 +803,10 @@ fn render_weather_panel(f: &mut Frame, area: Rect, board: &WeatherBoard) {
                             .add_modifier(Modifier::BOLD),
                     ),
                     Span::raw("  "),
-                    Span::raw(format!("{}  {}°C", condition, temperature)),
+                    Span::raw(format!("{}  {}", condition, temperature)),
                 ]));
-                lines.push(Line::from(format!("  更新时间 {}", last_update)));
             }
-            WeatherCard::Error { label, code, message } => {
+            WeatherCard::Error { label, message } => {
                 lines.push(Line::from(vec![
                     Span::styled(
                         label.as_str(),
@@ -864,16 +816,13 @@ fn render_weather_panel(f: &mut Frame, area: Rect, board: &WeatherBoard) {
                     ),
                     Span::raw("  "),
                     Span::styled(
-                        format!("错误 {}", code),
-                        Style::default()
-                            .fg(Color::Yellow)
-                            .add_modifier(Modifier::BOLD),
+                        message.as_str(),
+                        Style::default().fg(Color::Yellow),
                     ),
                 ]));
-                lines.push(Line::from(format!("  {}", message)));
             }
         }
-        if idx + 1 < board.cards.len() {
+        if idx + 1 < cards.len() {
             lines.push(Line::default());
         }
     }
@@ -904,28 +853,37 @@ fn render_bill_view(f: &mut Frame, size: Rect, bill_state: &BillState, last_msg:
         .block(Block::default().borders(Borders::ALL).title("Bill"));
     f.render_widget(header, chunks[0]);
 
-    let mut info_lines = vec![
-        format!("账单目录: {}", bill_state.bill_dir.display()),
-        format!("待分析账单: {}", bill_state.pending_count()),
-        format!("已分析账单: {}", bill_state.processed.len()),
-    ];
-    if let Some(net_line) = bill_state.net_summary() {
-        info_lines.push(net_line);
+    if bill_state.files.is_empty() {
+        let info_block = Paragraph::new("暂无账单")
+            .alignment(Alignment::Center)
+            .block(Block::default().borders(Borders::ALL).title("状态"));
+        f.render_widget(info_block, chunks[1]);
     } else {
-        info_lines.push("暂无净收入/净支出".into());
+        let mut info_lines = vec![
+            format!("账单目录: {}", bill_state.bill_dir.display()),
+            format!("待分析账单: {}", bill_state.pending_count()),
+            format!("已分析账单: {}", bill_state.processed.len()),
+        ];
+        
+        if !bill_state.aggregate.is_empty() {
+            let net = bill_state.aggregate.net();
+            let label = if net >= 0.0 { "净收入" } else { "净支出" };
+            info_lines.push(format!("{}：{:.2} 元", label, net.abs()));
+        }
+        
+        let info_block = Paragraph::new(info_lines.join("\n"))
+            .alignment(Alignment::Left)
+            .block(Block::default().borders(Borders::ALL).title("状态"));
+        f.render_widget(info_block, chunks[1]);
     }
-    let info_block = Paragraph::new(info_lines.join("\n"))
-        .alignment(Alignment::Left)
-        .block(Block::default().borders(Borders::ALL).title("状态"));
-    f.render_widget(info_block, chunks[1]);
 
-    let mut help_lines = vec![String::from(
-        "a -- 分析 | o -- 导出 | r -- 刷新 | q -- 返回",
-    )];
-    if let Some(msg) = last_msg {
-        help_lines.push(msg.to_string());
-    }
-    let help = Paragraph::new(help_lines.join("\n"))
+    let help_text = if let Some(msg) = last_msg {
+        format!("a -- 分析 | o -- 导出 | r -- 刷新 | q -- 返回\n{}", msg)
+    } else {
+        "a -- 分析 | o -- 导出 | r -- 刷新 | q -- 返回".to_string()
+    };
+    
+    let help = Paragraph::new(help_text)
         .alignment(Alignment::Left)
         .block(Block::default().borders(Borders::ALL).title("操作"));
     f.render_widget(help, chunks[2]);
@@ -966,10 +924,12 @@ enum MenuItem {
     Bill,
     Cyber,
 }
+
 impl MenuItem {
     fn all() -> [MenuItem; 3] {
         [MenuItem::Todo, MenuItem::Bill, MenuItem::Cyber]
     }
+    
     fn title(&self) -> &'static str {
         match self {
             MenuItem::Todo => "TODO",
@@ -998,9 +958,15 @@ fn run_app(
     let mut cyber_scroll = 0usize;
 
     let mut bill_state = BillState::new(cfg);
-    let (weather_board, weather_msg) = fetch_weather_board_with_retry(cfg);
-    if let Some(msg) = weather_msg {
-        last_msg = Some(msg);
+    let mut weather_cards = Vec::new(); // 初始化为空，按w再加载
+    
+    // 创建通道用于接收天气数据
+    let (weather_tx, weather_rx) = mpsc::channel::<Vec<WeatherCard>>();
+    let weather_rx = Arc::new(Mutex::new(weather_rx));
+    
+    // 检查天气API密钥状态
+    if cfg.weather_api_key.trim().is_empty() {
+        last_msg = Some("警告: 未配置天气API密钥，请在config.toml中设置weather_api_key".to_string());
     }
 
     loop {
@@ -1067,15 +1033,15 @@ fn run_app(
                         .constraints([Constraint::Percentage(35), Constraint::Percentage(65)])
                         .split(chunks[1]);
                     f.render_stateful_widget(list, body[0], &mut list_state);
-                    render_weather_panel(f, body[1], &weather_board);
+                    render_weather_panel(f, body[1], &weather_cards);
 
                     let help = match &last_msg {
                         Some(m) => m.as_str(),
-                        None => "\tjk -- move, Enter -- select, q -- exit",
+                        None => "jk -- move, Enter -- select, w -- load weather, q -- exit",
                     };
                     let footer = Paragraph::new(help)
                         .alignment(Alignment::Left)
-                        .block(Block::default().borders(Borders::ALL).title("Message"));
+                        .block(Block::default().borders(Borders::ALL).title("Help"));
                     f.render_widget(footer, chunks[2]);
                 }
                 AppState::TodoView => {
@@ -1097,6 +1063,14 @@ fn run_app(
                 }
             }
         })?;
+
+        // 检查是否有新的天气数据
+        if let Ok(rx) = weather_rx.try_lock() {
+            if let Ok(cards) = rx.try_recv() {
+                weather_cards = cards;
+                force_redraw = true;
+            }
+        }
 
         if event::poll(std::time::Duration::from_millis(250))? {
             if let Event::Key(key) = event::read()? {
@@ -1127,15 +1101,17 @@ fn run_app(
                                     state = AppState::CyberView;
                                     last_msg = None;
                                 }
-                                MenuItem::Bill => match bill_state.refresh_files() {
-                                    Ok(_) => {
-                                        state = AppState::BillView;
-                                        force_redraw = true;
-                                        last_msg = None;
-                                    }
-                                    Err(e) => last_msg = Some(format!("读取账单失败: {}", e)),
-                                },
+                                MenuItem::Bill => {
+                                    let _ = bill_state.refresh_files();
+                                    state = AppState::BillView;
+                                    force_redraw = true;
+                                    last_msg = None;
+                                }
                             },
+                            KeyCode::Char('w') => {
+                                // 启动后台线程加载天气数据
+                                fetch_weather_board(cfg.clone(), weather_tx.clone());
+                            }
                             _ => {}
                         },
                         AppState::TodoView => match key.code {
@@ -1212,9 +1188,13 @@ fn run_app(
                             KeyCode::Char('a') => {
                                 match bill_state.analyze_pending() {
                                     Ok(n) => {
-                                        let net = bill_state
-                                            .net_summary()
-                                            .unwrap_or_else(|| "暂无统计数据".into());
+                                        let net = if bill_state.aggregate.is_empty() {
+                                            "暂无统计数据".to_string()
+                                        } else {
+                                            let net_val = bill_state.aggregate.net();
+                                            let label = if net_val >= 0.0 { "净收入" } else { "净支出" };
+                                            format!("{}：{:.2} 元", label, net_val.abs())
+                                        };
                                         last_msg = Some(format!("完成 {} 份账单分析 | {}", n, net));
                                     }
                                     Err(e) => last_msg = Some(e),
@@ -1225,7 +1205,8 @@ fn run_app(
                                 if bill_state.aggregate.is_empty() {
                                     last_msg = Some("请先按a完成分析".into());
                                 } else {
-                                    match prompt_export_directory(&bill_state.last_export_dir) {
+                                    let default_dir = &bill_state.bill_dir;
+                                    match prompt_export_directory(default_dir) {
                                         Ok(dir) => match bill_state.export_reports(&dir) {
                                             Ok(count) => {
                                                 last_msg = Some(format!(
@@ -1233,7 +1214,6 @@ fn run_app(
                                                     count,
                                                     dir.display()
                                                 ));
-                                                bill_state.last_export_dir = dir;
                                             }
                                             Err(e) => last_msg = Some(format!("导出失败: {}", e)),
                                         },
