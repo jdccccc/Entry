@@ -1,3 +1,4 @@
+use std::cmp::Ordering;
 use std::collections::HashSet;
 use std::fmt::Write as FmtWrite;
 use std::fs;
@@ -53,19 +54,9 @@ impl Default for Config {
 }
 
 fn load_config() -> Config {
-    let path = "config.toml";
-    if Path::new(path).exists() {
-        match fs::read_to_string(path) {
-            Ok(s) => toml::from_str(&s).unwrap_or_default(),
-            Err(_) => Config::default(),
-        }
-    } else {
-        let cfg = Config::default();
-        if let Ok(text) = toml::to_string_pretty(&cfg) {
-            let _ = fs::write(path, text);
-        }
-        cfg
-    }
+    // 编译期嵌入 config.toml，二进制不再依赖外部文件
+    let embedded = include_str!("../config.toml");
+    toml::from_str(embedded).unwrap_or_default()
 }
 
 // ---------------- Weather ----------------
@@ -86,14 +77,13 @@ const WEATHER_LOCATIONS: [WeatherLocation; 2] = [
     },
 ];
 
-const WEATHER_ENDPOINT: &str = "http://api.weatherapi.com/v1/forecast.json";
+const WEATHER_ENDPOINT: &str = "https://api.seniverse.com/v3/weather/daily.json";
 
 #[derive(Debug, Clone)]
 enum WeatherCard {
     Success {
         name: String,
-        condition: String,
-        temperature: String,
+        forecasts: Vec<DailySummary>,
     },
     Error {
         label: String,
@@ -101,43 +91,47 @@ enum WeatherCard {
     },
 }
 
-#[derive(Debug, Deserialize)]
-struct WeatherApiResponse {
-    location: WeatherApiLocation,
-    current: WeatherApiCurrent,
-    forecast: WeatherApiForecast,
+#[derive(Debug, Clone)]
+struct DailySummary {
+    day_label: String,
+    condition: String,
+    temperature: String,
 }
 
 #[derive(Debug, Deserialize)]
-struct WeatherApiLocation {
+struct SeniverseResponse {
+    results: Vec<SeniverseResult>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SeniverseResult {
+    location: SeniverseLocation,
+    daily: Vec<SeniverseDaily>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SeniverseLocation {
     name: String,
 }
 
 #[derive(Debug, Deserialize)]
-struct WeatherApiCurrent {
-    condition: WeatherApiCondition,
-    temp_c: f64,
+struct SeniverseDaily {
+    #[serde(default)]
+    text_day: String,
+    #[serde(default)]
+    high: String,
+    #[serde(default)]
+    low: String,
 }
 
 #[derive(Debug, Deserialize)]
-struct WeatherApiForecast {
-    forecastday: Vec<WeatherApiForecastDay>,
-}
-
-#[derive(Debug, Deserialize)]
-struct WeatherApiForecastDay {
-    day: WeatherApiDay,
-}
-
-#[derive(Debug, Deserialize)]
-struct WeatherApiDay {
-    maxtemp_c: f64,
-    mintemp_c: f64,
-}
-
-#[derive(Debug, Deserialize)]
-struct WeatherApiCondition {
-    text: String,
+struct SeniverseError {
+    #[serde(default)]
+    status: String,
+    #[serde(default)]
+    status_code: String,
+    #[serde(default)]
+    message: String,
 }
 
 fn fetch_weather_board(cfg: Config, sender: mpsc::Sender<Vec<WeatherCard>>) {
@@ -151,7 +145,7 @@ fn fetch_weather_board(cfg: Config, sender: mpsc::Sender<Vec<WeatherCard>>) {
                     message: "请在config.toml中配置weather_api_key".to_string(),
                 })
                 .collect();
-            
+
             let _ = sender.send(cards);
             return;
         }
@@ -164,17 +158,15 @@ fn fetch_weather_board(cfg: Config, sender: mpsc::Sender<Vec<WeatherCard>>) {
         // 使用并行请求提高性能
         let client = Arc::new(client);
         let key = Arc::new(key.to_string());
-        
+
         let cards: Vec<WeatherCard> = WEATHER_LOCATIONS
             .iter()
             .map(|loc| {
                 let client = Arc::clone(&client);
                 let key = Arc::clone(&key);
                 let loc = loc.clone();
-                
-                std::thread::spawn(move || {
-                    fetch_city_weather(&client, &key, &loc)
-                })
+
+                std::thread::spawn(move || fetch_city_weather(&client, &key, &loc))
             })
             .collect::<Vec<_>>()
             .into_iter()
@@ -190,10 +182,11 @@ fn fetch_city_weather(client: &Client, api_key: &str, loc: &WeatherLocation) -> 
         .get(WEATHER_ENDPOINT)
         .query(&[
             ("key", api_key),
-            ("q", loc.query),
-            ("lang", "zh"),
-            ("aqi", "no"),
-            ("days", "1"),
+            ("location", loc.query),
+            ("language", "zh-Hans"),
+            ("unit", "c"),
+            ("start", "0"),
+            ("days", "3"),
         ])
         .send()
     {
@@ -207,19 +200,52 @@ fn fetch_city_weather(client: &Client, api_key: &str, loc: &WeatherLocation) -> 
     };
 
     if !response.status().is_success() {
-        let error_msg = match response.status().as_u16() {
+        // 读取状态码后再消费 body，避免 move 冲突
+        let status = response.status();
+        // 尝试读取并解析错误信息，帮助定位密钥/套餐问题
+        let body_text = response.text().unwrap_or_default();
+        let parsed_err: Option<SeniverseError> = serde_json::from_str(&body_text).ok();
+        let extra = parsed_err
+            .as_ref()
+            .and_then(|e| {
+                let code = if !e.status_code.is_empty() {
+                    e.status_code.as_str()
+                } else if !e.status.is_empty() {
+                    e.status.as_str()
+                } else {
+                    ""
+                };
+                let msg = e.message.trim();
+                if code.is_empty() && msg.is_empty() {
+                    None
+                } else if code.is_empty() {
+                    Some(msg.to_string())
+                } else if msg.is_empty() {
+                    Some(format!("({code})"))
+                } else {
+                    Some(format!("({code}) {msg}"))
+                }
+            })
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| body_text.clone());
+
+        let error_msg = match status.as_u16() {
             401 => "API密钥无效或已过期".to_string(),
-            403 => "API访问被拒绝，请检查密钥权限".to_string(),
+            403 => "API访问被拒绝，请检查密钥权限/套餐".to_string(),
             400 => "请求参数错误".to_string(),
             404 => "城市未找到".to_string(),
             429 => "API请求频率超限".to_string(),
             500..=599 => "天气服务器内部错误".to_string(),
-            _ => format!("天气API错误 (HTTP {})", response.status()),
+            _ => format!("天气API错误 (HTTP {})", status),
         };
-        
+
         return WeatherCard::Error {
             label: loc.label.to_string(),
-            message: error_msg,
+            message: if extra.is_empty() {
+                error_msg
+            } else {
+                format!("{error_msg} {extra}")
+            },
         };
     }
 
@@ -233,25 +259,56 @@ fn fetch_city_weather(client: &Client, api_key: &str, loc: &WeatherLocation) -> 
         }
     };
 
-    match serde_json::from_slice::<WeatherApiResponse>(&bytes) {
+    match serde_json::from_slice::<SeniverseResponse>(&bytes) {
         Ok(data) => {
-            // 获取当天的预报数据
-            let forecast_day = data.forecast.forecastday.first();
-            
-            match forecast_day {
-                Some(day) => {
-                    WeatherCard::Success {
-                        name: data.location.name,
-                        condition: data.current.condition.text,
-                        temperature: format!("{:.1}C~{:.1}C", day.day.mintemp_c, day.day.maxtemp_c),
+            let result = data.results.first();
+            match result {
+                Some(res) => {
+                    let labels = ["今天", "明天", "后天"];
+                    let forecasts: Vec<DailySummary> = res
+                        .daily
+                        .iter()
+                        .zip(labels.iter())
+                        .map(|(day, label)| {
+                            let condition = if day.text_day.is_empty() {
+                                "未知天气".to_string()
+                            } else {
+                                day.text_day.clone()
+                            };
+                            let high = if day.high.is_empty() {
+                                "??".to_string()
+                            } else {
+                                day.high.clone()
+                            };
+                            let low = if day.low.is_empty() {
+                                "??".to_string()
+                            } else {
+                                day.low.clone()
+                            };
+                            DailySummary {
+                                day_label: (*label).to_string(),
+                                condition,
+                                temperature: format!("{low}C~{high}C"),
+                            }
+                        })
+                        .collect();
+
+                    if forecasts.is_empty() {
+                        WeatherCard::Error {
+                            label: loc.label.to_string(),
+                            message: "无法获取预报数据".to_string(),
+                        }
+                    } else {
+                        WeatherCard::Success {
+                            name: res.location.name.clone(),
+                            forecasts,
+                        }
                     }
                 }
-                None => {
-                    WeatherCard::Error {
-                        label: loc.label.to_string(),
-                        message: "无法获取预报数据".to_string(),
-                    }
-                }
+                None => WeatherCard::Error {
+                    label: loc.label.to_string(),
+                    message: "天气数据为空".to_string(),
+                },
             }
         }
         Err(_) => WeatherCard::Error {
@@ -376,35 +433,41 @@ impl BillAggregate {
     }
 
     fn to_markdown(&self) -> String {
+        let mut expenses_sorted = self.expenses.clone();
+        expenses_sorted.sort_by(|a, b| b.amount.partial_cmp(&a.amount).unwrap_or(Ordering::Equal));
+
+        let mut incomes_sorted = self.incomes.clone();
+        incomes_sorted.sort_by(|a, b| b.amount.partial_cmp(&a.amount).unwrap_or(Ordering::Equal));
+
         let mut out = String::new();
         let _ = writeln!(&mut out, "# 账单分析\n");
-        
+
         let _ = writeln!(out, "## 支出");
-        if self.expenses.is_empty() {
+        if expenses_sorted.is_empty() {
             out.push_str("无支出记录。\n");
         } else {
             out.push_str("| 交易对方 | 商品 | 金额(元) |\n|----------|------|----------|\n");
-            for e in &self.expenses {
+            for e in &expenses_sorted {
                 let _ = writeln!(out, "| {} | {} | {:.2} |", e.partner, e.product, e.amount);
             }
             let _ = writeln!(out, "\n总支出：{:.2} 元\n", self.total_expense());
         }
-        
+
         let _ = writeln!(out, "## 收入");
-        if self.incomes.is_empty() {
+        if incomes_sorted.is_empty() {
             out.push_str("无收入记录。\n");
         } else {
             out.push_str("| 交易对方 | 商品 | 金额(元) |\n|----------|------|----------|\n");
-            for e in &self.incomes {
+            for e in &incomes_sorted {
                 let _ = writeln!(out, "| {} | {} | {:.2} |", e.partner, e.product, e.amount);
             }
             let _ = writeln!(out, "\n总收入：{:.2} 元\n", self.total_income());
         }
-        
+
         let net = self.net();
         let label = if net >= 0.0 { "净收入" } else { "净支出" };
         let _ = writeln!(out, "{}：{:.2} 元", label, net.abs());
-        
+
         out
     }
 }
@@ -431,7 +494,7 @@ impl BillState {
         if !self.bill_dir.exists() {
             fs::create_dir_all(&self.bill_dir)?;
         }
-        
+
         let mut list: Vec<PathBuf> = fs::read_dir(&self.bill_dir)?
             .filter_map(|entry| entry.ok())
             .map(|entry| entry.path())
@@ -519,7 +582,7 @@ fn analyze_bill_file(path: &Path) -> Result<BillAggregate, String> {
         .and_then(|ext| ext.to_str())
         .map(|s| s.to_ascii_lowercase())
         .ok_or_else(|| "无法识别文件类型".to_string())?;
-    
+
     match ext.as_str() {
         "xlsx" => parse_wechat_bill(path),
         "csv" => parse_alipay_bill(path),
@@ -552,22 +615,22 @@ fn parse_wechat_bill(path: &Path) -> Result<BillAggregate, String> {
         let partner = row.get(2).map(cell_to_string).unwrap_or_default();
         let product = row.get(3).map(cell_to_string).unwrap_or_default();
         let amount_str = row.get(5).map(cell_to_string).unwrap_or_default();
-        
+
         if category.is_empty() || amount_str.is_empty() {
             continue;
         }
-        
+
         let amount = match parse_amount(&amount_str) {
             Some(v) => v,
             None => continue,
         };
-        
+
         let entry = BillEntry {
             partner,
             product,
             amount,
         };
-        
+
         if category.contains('支') {
             expenses.push(entry);
         } else if category.contains('收') {
@@ -583,7 +646,7 @@ fn parse_alipay_bill(path: &Path) -> Result<BillAggregate, String> {
     if let Some(stripped) = content.strip_prefix('\u{feff}') {
         content = stripped.to_string();
     }
-    
+
     let start = content
         .find("交易时间,")
         .ok_or_else(|| "未找到账单数据表头".to_string())?;
@@ -600,19 +663,19 @@ fn parse_alipay_bill(path: &Path) -> Result<BillAggregate, String> {
         if record.len() < 7 {
             continue;
         }
-        
+
         let flow = record.get(5).unwrap_or("").trim();
         let amount_text = record.get(6).unwrap_or("").trim();
-        
+
         if flow.is_empty() || amount_text.is_empty() {
             continue;
         }
-        
+
         let amount = match parse_amount(amount_text) {
             Some(v) => v,
             None => continue,
         };
-        
+
         let entry = BillEntry {
             partner: record.get(2).unwrap_or("").trim().to_string(),
             product: record.get(4).unwrap_or("").trim().to_string(),
@@ -771,7 +834,7 @@ fn render_table_page(
 
     render_table_generic(f, chunks[1], rows, scroll, table_title);
 
-    let help = Paragraph::new("\tjk -- move | q -- back | e -- edit | r -- refresh")
+    let help = Paragraph::new("jk -- move | q -- back | e -- edit | r -- refresh")
         .alignment(Alignment::Center)
         .block(Block::default().borders(Borders::ALL).title("Help"));
     f.render_widget(help, chunks[2]);
@@ -790,35 +853,35 @@ fn render_weather_panel(f: &mut Frame, area: Rect, cards: &[WeatherCard]) {
     let mut lines: Vec<Line> = Vec::new();
     for (idx, card) in cards.iter().enumerate() {
         match card {
-            WeatherCard::Success {
-                name,
-                condition,
-                temperature,
-            } => {
-                lines.push(Line::from(vec![
-                    Span::styled(
-                        name.as_str(),
-                        Style::default()
-                            .fg(Color::Cyan)
-                            .add_modifier(Modifier::BOLD),
-                    ),
-                    Span::raw("  "),
-                    Span::raw(format!("{}  {}", condition, temperature)),
-                ]));
+            WeatherCard::Success { name, forecasts } => {
+                for (idx, fc) in forecasts.iter().enumerate() {
+                    let title = if idx == 0 { name.as_str() } else { "  " };
+                    lines.push(Line::from(vec![
+                        Span::styled(
+                            title,
+                            Style::default()
+                                .fg(Color::Cyan)
+                                .add_modifier(Modifier::BOLD),
+                        ),
+                        Span::raw("  "),
+                        Span::styled(
+                            format!("{} ", fc.day_label),
+                            Style::default()
+                                .fg(Color::White)
+                                .add_modifier(Modifier::BOLD),
+                        ),
+                        Span::raw(format!("{}  {}", fc.condition, fc.temperature)),
+                    ]));
+                }
             }
             WeatherCard::Error { label, message } => {
                 lines.push(Line::from(vec![
                     Span::styled(
                         label.as_str(),
-                        Style::default()
-                            .fg(Color::Red)
-                            .add_modifier(Modifier::BOLD),
+                        Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
                     ),
                     Span::raw("  "),
-                    Span::styled(
-                        message.as_str(),
-                        Style::default().fg(Color::Yellow),
-                    ),
+                    Span::styled(message.as_str(), Style::default().fg(Color::Yellow)),
                 ]));
             }
         }
@@ -827,9 +890,7 @@ fn render_weather_panel(f: &mut Frame, area: Rect, cards: &[WeatherCard]) {
         }
     }
 
-    let paragraph = Paragraph::new(lines)
-        .block(block)
-        .wrap(Wrap { trim: true });
+    let paragraph = Paragraph::new(lines).block(block).wrap(Wrap { trim: true });
     f.render_widget(paragraph, area);
 }
 
@@ -864,13 +925,13 @@ fn render_bill_view(f: &mut Frame, size: Rect, bill_state: &BillState, last_msg:
             format!("待分析账单: {}", bill_state.pending_count()),
             format!("已分析账单: {}", bill_state.processed.len()),
         ];
-        
+
         if !bill_state.aggregate.is_empty() {
             let net = bill_state.aggregate.net();
             let label = if net >= 0.0 { "净收入" } else { "净支出" };
             info_lines.push(format!("{}：{:.2} 元", label, net.abs()));
         }
-        
+
         let info_block = Paragraph::new(info_lines.join("\n"))
             .alignment(Alignment::Left)
             .block(Block::default().borders(Borders::ALL).title("状态"));
@@ -882,7 +943,7 @@ fn render_bill_view(f: &mut Frame, size: Rect, bill_state: &BillState, last_msg:
     } else {
         "a -- 分析 | o -- 导出 | r -- 刷新 | q -- 返回".to_string()
     };
-    
+
     let help = Paragraph::new(help_text)
         .alignment(Alignment::Left)
         .block(Block::default().borders(Borders::ALL).title("操作"));
@@ -929,7 +990,7 @@ impl MenuItem {
     fn all() -> [MenuItem; 3] {
         [MenuItem::Todo, MenuItem::Bill, MenuItem::Cyber]
     }
-    
+
     fn title(&self) -> &'static str {
         match self {
             MenuItem::Todo => "TODO",
@@ -959,14 +1020,15 @@ fn run_app(
 
     let mut bill_state = BillState::new(cfg);
     let mut weather_cards = Vec::new(); // 初始化为空，按w再加载
-    
+
     // 创建通道用于接收天气数据
     let (weather_tx, weather_rx) = mpsc::channel::<Vec<WeatherCard>>();
     let weather_rx = Arc::new(Mutex::new(weather_rx));
-    
+
     // 检查天气API密钥状态
     if cfg.weather_api_key.trim().is_empty() {
-        last_msg = Some("警告: 未配置天气API密钥，请在config.toml中设置weather_api_key".to_string());
+        last_msg =
+            Some("警告: 未配置天气API密钥，请在config.toml中设置weather_api_key".to_string());
     }
 
     loop {
@@ -1030,7 +1092,7 @@ fn run_app(
 
                     let body = Layout::default()
                         .direction(Direction::Horizontal)
-                        .constraints([Constraint::Percentage(35), Constraint::Percentage(65)])
+                        .constraints([Constraint::Percentage(65), Constraint::Percentage(35)])
                         .split(chunks[1]);
                     f.render_stateful_widget(list, body[0], &mut list_state);
                     render_weather_panel(f, body[1], &weather_cards);
@@ -1192,7 +1254,11 @@ fn run_app(
                                             "暂无统计数据".to_string()
                                         } else {
                                             let net_val = bill_state.aggregate.net();
-                                            let label = if net_val >= 0.0 { "净收入" } else { "净支出" };
+                                            let label = if net_val >= 0.0 {
+                                                "净收入"
+                                            } else {
+                                                "净支出"
+                                            };
                                             format!("{}：{:.2} 元", label, net_val.abs())
                                         };
                                         last_msg = Some(format!("完成 {} 份账单分析 | {}", n, net));

@@ -1,4 +1,4 @@
-todo_file_path = "./tmp/TODO.md"
-cyber_resource_file_path = "./tmp/CYBER_RESOURCE.md"
-bill_dir_path = "./tmp"
-weather_api_key = "40e289a8fe3f46388d865617251311"
+todo_file_path = "/home/loverain/dotFile_arch/entry/TODO.md"
+cyber_resource_file_path = "/home/loverain/dotFile_arch/entry/CYBER_RESOURCE.md"
+bill_dir_path = "/home/loverain/dotFile_arch/entry/bill/"
+weather_api_key = "Sv9WAjQd08LTazEXL"
